@@ -1,4 +1,4 @@
-// Package main is the entry point for EasyProxy Go.
+// Package main is the entry point for MediaProxy.
 package main
 
 import (

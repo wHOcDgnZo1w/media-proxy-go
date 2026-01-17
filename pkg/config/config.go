@@ -2,6 +2,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 type Config struct {
 	// Server settings
 	Port         int
+	BaseURL      string
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	IdleTimeout  time.Duration
@@ -38,6 +40,10 @@ type Config struct {
 
 	// Stremio addon
 	StremioEnabled bool
+
+	// FlareSolverr settings (for Cloudflare bypass)
+	FlareSolverrURL     string
+	FlareSolverrTimeout time.Duration
 }
 
 // TransportRoute defines URL-specific proxy routing.
@@ -45,12 +51,15 @@ type TransportRoute struct {
 	URLPattern string
 	Proxy      string
 	DisableSSL bool
+	Direct     bool // If true, bypass global proxy and connect directly
 }
 
 // Load reads configuration from environment variables with sensible defaults.
 func Load() *Config {
+	port := getEnvInt("PORT", 7860)
 	cfg := &Config{
-		Port:                    getEnvInt("PORT", 7860),
+		Port:                    port,
+		BaseURL:                 getEnvString("BASE_URL", fmt.Sprintf("http://localhost:%d", port)),
 		ReadTimeout:             getEnvDuration("READ_TIMEOUT", 30*time.Second),
 		WriteTimeout:            getEnvDuration("WRITE_TIMEOUT", 120*time.Second),
 		IdleTimeout:             getEnvDuration("IDLE_TIMEOUT", 60*time.Second),
@@ -60,10 +69,12 @@ func Load() *Config {
 		MaxRecordingDuration:    getEnvDuration("MAX_RECORDING_DURATION", 8*time.Hour),
 		RecordingsRetentionDays: getEnvInt("RECORDINGS_RETENTION_DAYS", 7),
 		FFmpegPath:              getEnvString("FFMPEG_PATH", "ffmpeg"),
-		FFmpegOutputDir:         getEnvString("FFMPEG_OUTPUT_DIR", "/tmp/easyproxy-streams"),
+		FFmpegOutputDir:         getEnvString("FFMPEG_OUTPUT_DIR", "/tmp/mediaproxy-streams"),
 		LogLevel:                getEnvString("LOG_LEVEL", "info"),
 		LogJSON:                 getEnvBool("LOG_JSON", false),
 		StremioEnabled:          getEnvBool("STREMIO_ENABLED", true),
+		FlareSolverrURL:         getEnvString("FLARESOLVERR_URL", ""),
+		FlareSolverrTimeout:     getEnvDuration("FLARESOLVERR_TIMEOUT", 60*time.Second),
 	}
 
 	cfg.TransportRoutes = parseTransportRoutes(os.Getenv("TRANSPORT_ROUTES"))
@@ -111,6 +122,8 @@ func parseTransportRoutes(s string) []TransportRoute {
 				route.Proxy = value
 			case "DISABLE_SSL":
 				route.DisableSSL = strings.ToLower(value) == "true"
+			case "DIRECT":
+				route.Direct = strings.ToLower(value) == "true"
 			}
 		}
 		if route.URLPattern != "" {

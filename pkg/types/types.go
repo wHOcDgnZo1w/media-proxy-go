@@ -27,6 +27,7 @@ type StreamRequest struct {
 	Force          bool
 	Extension      string
 	RepID          string
+	NoBypass       bool // Force all segments through proxy (for recordings)
 }
 
 // StreamResponse represents the result of stream processing.
@@ -42,6 +43,7 @@ type StreamResponse struct {
 type ExtractResult struct {
 	DestinationURL    string            `json:"destination_url"`
 	RequestHeaders    map[string]string `json:"request_headers"`
+	RequestCookies    string            `json:"request_cookies,omitempty"` // Cookie header value for stream requests
 	MediaflowEndpoint string            `json:"mediaflow_endpoint"`
 	MediaflowProxyURL string            `json:"mediaflow_proxy_url,omitempty"`
 	QueryParams       map[string]string `json:"query_params,omitempty"`

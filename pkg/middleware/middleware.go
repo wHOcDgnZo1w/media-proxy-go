@@ -43,12 +43,12 @@ func Logging(log *logging.Logger) func(http.Handler) http.Handler {
 			requestID := r.Header.Get("X-Request-ID")
 			reqLog := log.RequestLogger(r.Method, r.URL.Path, r.RemoteAddr, requestID)
 
-			reqLog.Info("request started")
+			reqLog.Debug("request started")
 
 			next.ServeHTTP(wrapped, r)
 
 			duration := time.Since(start)
-			reqLog.WithDuration(duration).Info("request completed",
+			reqLog.WithDuration(duration).Debug("request completed",
 				"status", wrapped.statusCode,
 				"bytes", wrapped.bytesWritten,
 			)

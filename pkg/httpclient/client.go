@@ -2,8 +2,10 @@
 package httpclient
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,17 +16,45 @@ import (
 	"media-proxy-go/pkg/config"
 	"media-proxy-go/pkg/logging"
 
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 )
 
 // Client wraps http.Client with proxy routing and connection pooling.
 type Client struct {
 	defaultClient *http.Client
+	utlsClient    *http.Client // Client with browser-like TLS fingerprint for Cloudflare bypass
 	proxyClients  map[string]*http.Client
 	routes        []config.TransportRoute
 	globalProxies []string
 	mu            sync.RWMutex
 	log           *logging.Logger
+}
+
+// Domains that require browser-like TLS fingerprinting (Cloudflare protected)
+var utlsDomains = []string{
+	"newkso.ru",
+	"dlhd.",
+	"daddylive",
+}
+
+// ipv4Dialer creates a dialer that only uses IPv4.
+// This avoids issues with IPv6 connectivity in environments where IPv6 is not available.
+func ipv4Dialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 60 * time.Second,
+	}
+}
+
+// ipv4DialContext forces IPv4-only connections.
+func ipv4DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	// Force IPv4 by using "tcp4" instead of "tcp"
+	if network == "tcp" {
+		network = "tcp4"
+	}
+	return ipv4Dialer().DialContext(ctx, network, addr)
 }
 
 // New creates a new HTTP client with the given configuration.
@@ -36,13 +66,10 @@ func New(cfg *config.Config, log *logging.Logger) *Client {
 		log:           log.WithComponent("httpclient"),
 	}
 
-	// Default client with connection pooling
+	// Default client with connection pooling (IPv4 only)
 	c.defaultClient = &http.Client{
 		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 60 * time.Second,
-			}).DialContext,
+			DialContext:           ipv4DialContext,
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       90 * time.Second,
@@ -53,7 +80,129 @@ func New(cfg *config.Config, log *logging.Logger) *Client {
 		Timeout: 30 * time.Second,
 	}
 
+	// Create utls client with browser-like TLS fingerprint for Cloudflare bypass
+	c.utlsClient = c.createUTLSClient()
+
 	return c
+}
+
+// createUTLSClient creates an HTTP client with browser-like TLS fingerprinting.
+func (c *Client) createUTLSClient() *http.Client {
+	// Use HTTP/2 transport with utls for Cloudflare bypass
+	return &http.Client{
+		Transport: newUTLSRoundTripper(),
+		Timeout:   30 * time.Second,
+	}
+}
+
+// utlsRoundTripper implements http.RoundTripper with utls and HTTP/2 support
+type utlsRoundTripper struct {
+	dialer      *net.Dialer
+	h2Transport *http2.Transport
+}
+
+func newUTLSRoundTripper() *utlsRoundTripper {
+	return &utlsRoundTripper{
+		dialer: &net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 60 * time.Second,
+		},
+		h2Transport: &http2.Transport{
+			DisableCompression: false,
+			AllowHTTP:          false,
+		},
+	}
+}
+
+func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Only handle HTTPS
+	if req.URL.Scheme != "https" {
+		return http.DefaultTransport.RoundTrip(req)
+	}
+
+	addr := req.URL.Host
+	if !strings.Contains(addr, ":") {
+		addr = addr + ":443"
+	}
+
+	// Force IPv4
+	conn, err := t.dialer.DialContext(req.Context(), "tcp4", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Extract hostname for SNI
+	host := req.URL.Hostname()
+
+	// Create utls connection with Chrome fingerprint
+	tlsConfig := &utls.Config{
+		ServerName: host,
+	}
+
+	// Use Chrome 120 fingerprint with HTTP/2
+	utlsConn := utls.UClient(conn, tlsConfig, utls.HelloChrome_120)
+
+	// Perform TLS handshake
+	if err := utlsConn.Handshake(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	// Check negotiated protocol
+	alpn := utlsConn.ConnectionState().NegotiatedProtocol
+
+	if alpn == "h2" {
+		// Use HTTP/2
+		h2Conn, err := t.h2Transport.NewClientConn(utlsConn)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return h2Conn.RoundTrip(req)
+	}
+
+	// Fallback to HTTP/1.1
+	return t.doHTTP1Request(utlsConn, req)
+}
+
+func (t *utlsRoundTripper) doHTTP1Request(conn net.Conn, req *http.Request) (*http.Response, error) {
+	// Write request
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	// Read response
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	// Wrap body to close connection when done
+	resp.Body = &connCloser{resp.Body, conn}
+	return resp, nil
+}
+
+type connCloser struct {
+	io.ReadCloser
+	conn net.Conn
+}
+
+func (c *connCloser) Close() error {
+	c.ReadCloser.Close()
+	return c.conn.Close()
+}
+
+// needsUTLS returns true if the URL requires browser-like TLS fingerprinting.
+func (c *Client) needsUTLS(targetURL string) bool {
+	lower := strings.ToLower(targetURL)
+	for _, domain := range utlsDomains {
+		if strings.Contains(lower, domain) {
+			return true
+		}
+	}
+	return false
 }
 
 // Do executes an HTTP request, routing through proxies as configured.
@@ -69,9 +218,25 @@ func (c *Client) DoWithContext(ctx context.Context, req *http.Request) (*http.Re
 
 // getClientForURL returns the appropriate HTTP client based on URL routing rules.
 func (c *Client) getClientForURL(targetURL string) *http.Client {
-	// Check transport routes first
+	// Check if URL needs browser-like TLS fingerprinting (Cloudflare bypass)
+	if c.needsUTLS(targetURL) {
+		c.log.Debug("using utls client for Cloudflare bypass", "url", targetURL)
+		return c.utlsClient
+	}
+
+	// Check transport routes first (most specific)
 	for _, route := range c.routes {
 		if strings.Contains(targetURL, route.URLPattern) {
+			c.log.Debug("matched transport route", "url", targetURL, "pattern", route.URLPattern, "proxy", route.Proxy, "direct", route.Direct)
+
+			// Direct connection - bypass global proxy
+			if route.Direct {
+				if route.DisableSSL {
+					return c.getInsecureClient()
+				}
+				return c.defaultClient
+			}
+
 			if route.Proxy != "" {
 				return c.getOrCreateProxyClient(route.Proxy, route.DisableSSL)
 			}
@@ -79,6 +244,14 @@ func (c *Client) getClientForURL(targetURL string) *http.Client {
 				return c.getInsecureClient()
 			}
 		}
+	}
+
+	// Use global proxy if configured
+	if len(c.globalProxies) > 0 {
+		// Use first global proxy (could implement round-robin or failover later)
+		proxyURL := c.globalProxies[0]
+		c.log.Debug("using global proxy", "url", targetURL, "proxy", proxyURL)
+		return c.getOrCreateProxyClient(proxyURL, false)
 	}
 
 	return c.defaultClient
@@ -115,13 +288,8 @@ func (c *Client) getOrCreateProxyClient(proxyURL string, disableSSL bool) *http.
 
 // createProxyClient creates a new HTTP client for the given proxy.
 func (c *Client) createProxyClient(proxyURL string, disableSSL bool) *http.Client {
-	parsedURL, err := url.Parse(proxyURL)
-	if err != nil {
-		c.log.Error("failed to parse proxy URL", "url", proxyURL, "error", err)
-		return c.defaultClient
-	}
-
 	transport := &http.Transport{
+		DialContext:           ipv4DialContext,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
@@ -131,6 +299,20 @@ func (c *Client) createProxyClient(proxyURL string, disableSSL bool) *http.Clien
 
 	if disableSSL {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+
+	// If no proxy URL, just return client with transport (possibly with SSL disabled)
+	if proxyURL == "" {
+		return &http.Client{
+			Transport: transport,
+			Timeout:   30 * time.Second,
+		}
+	}
+
+	parsedURL, err := url.Parse(proxyURL)
+	if err != nil {
+		c.log.Error("failed to parse proxy URL", "url", proxyURL, "error", err)
+		return c.defaultClient
 	}
 
 	switch parsedURL.Scheme {
@@ -185,12 +367,14 @@ func FilteredHeaders(headers http.Header) http.Header {
 	return filtered
 }
 
-// ParseHeaderParams extracts headers from query parameters (h_* pattern).
+// ParseHeaderParams extracts headers from query parameters with h_ prefix.
+// It converts underscores to hyphens in header names (e.g., h_User_Agent -> User-Agent).
 func ParseHeaderParams(query url.Values) map[string]string {
 	headers := make(map[string]string)
 	for key, values := range query {
 		if strings.HasPrefix(key, "h_") && len(values) > 0 {
-			headerName := key[2:]
+			// Remove h_ prefix and convert underscores to hyphens
+			headerName := strings.ReplaceAll(key[2:], "_", "-")
 			headers[headerName] = values[0]
 		}
 	}

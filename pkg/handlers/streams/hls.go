@@ -15,6 +15,7 @@ import (
 	"media-proxy-go/pkg/interfaces"
 	"media-proxy-go/pkg/logging"
 	"media-proxy-go/pkg/types"
+	"media-proxy-go/pkg/urlutil"
 )
 
 // HLSHandler processes HLS (M3U8) streams.
@@ -41,14 +42,30 @@ func (h *HLSHandler) Type() types.StreamType {
 // CanHandle returns true if the URL appears to be an HLS stream.
 func (h *HLSHandler) CanHandle(urlStr string) bool {
 	lower := strings.ToLower(urlStr)
-	return strings.Contains(lower, ".m3u8") ||
-		strings.Contains(lower, "manifest") ||
-		strings.Contains(lower, "/hls/")
+	// Check for .m3u8 extension (most common HLS indicator)
+	if strings.Contains(lower, ".m3u8") {
+		return true
+	}
+	// Check for /hls/ path segment
+	if strings.Contains(lower, "/hls/") {
+		return true
+	}
+	// Check for manifest in path but exclude MPD-style manifests
+	if strings.Contains(lower, "manifest") &&
+		!strings.Contains(lower, ".mpd") &&
+		!strings.Contains(lower, "format=mpd") {
+		return true
+	}
+	return false
 }
 
 // HandleManifest fetches and rewrites an HLS manifest.
 func (h *HLSHandler) HandleManifest(ctx context.Context, req *types.StreamRequest, baseURL string) (*types.StreamResponse, error) {
-	h.log.Debug("handling HLS manifest", "url", req.URL)
+	h.log.Debug("handling HLS manifest",
+		"url", req.URL,
+		"headers", req.Headers,
+		"no_bypass", req.NoBypass,
+	)
 
 	// Fetch the original manifest
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, req.URL, nil)
@@ -66,11 +83,15 @@ func (h *HLSHandler) HandleManifest(ctx context.Context, req *types.StreamReques
 
 	resp, err := h.client.Do(httpReq)
 	if err != nil {
+		h.log.Error("failed to fetch manifest", "url", req.URL, "error", err)
 		return nil, fmt.Errorf("failed to fetch manifest: %w", err)
 	}
 	defer resp.Body.Close()
 
+	h.log.Debug("manifest fetch response", "url", req.URL, "status", resp.StatusCode)
+
 	if resp.StatusCode != http.StatusOK {
+		h.log.Warn("manifest fetch failed", "url", req.URL, "status", resp.StatusCode)
 		return &types.StreamResponse{
 			StatusCode: resp.StatusCode,
 		}, nil
@@ -83,7 +104,7 @@ func (h *HLSHandler) HandleManifest(ctx context.Context, req *types.StreamReques
 	}
 
 	// Rewrite the manifest
-	rewritten, err := h.rewriteManifest(body, req.URL, baseURL, req.Headers)
+	rewritten, err := h.rewriteManifest(body, req.URL, baseURL, req.Headers, req.NoBypass)
 	if err != nil {
 		return nil, fmt.Errorf("failed to rewrite manifest: %w", err)
 	}
@@ -128,12 +149,41 @@ func (h *HLSHandler) HandleSegment(ctx context.Context, req *types.StreamRequest
 	}, nil
 }
 
+// CDNs with fast-expiring tokens that should not be proxied
+var bypassProxyCDNs = []string{
+	"planetary.lovecdn.ru",
+	"lovecdn.ru",
+	"freeshot",
+}
+
+// shouldBypassProxy returns true if the URL should not be proxied (fast-expiring tokens).
+func (h *HLSHandler) shouldBypassProxy(urlStr string) bool {
+	lower := strings.ToLower(urlStr)
+	for _, cdn := range bypassProxyCDNs {
+		if strings.Contains(lower, cdn) {
+			return true
+		}
+	}
+	return false
+}
+
 // rewriteManifest rewrites URLs in an HLS manifest to route through the proxy.
-func (h *HLSHandler) rewriteManifest(manifest []byte, originalURL, proxyBaseURL string, headers map[string]string) ([]byte, error) {
+func (h *HLSHandler) rewriteManifest(manifest []byte, originalURL, proxyBaseURL string, headers map[string]string, noBypass bool) ([]byte, error) {
 	baseURL, err := url.Parse(originalURL)
 	if err != nil {
 		return nil, err
 	}
+
+	// Check if this is a bypass CDN - if so, don't rewrite segment URLs
+	// noBypass=true forces all segments through proxy (used for recordings)
+	bypassSegments := !noBypass && h.shouldBypassProxy(originalURL)
+
+	h.log.Debug("rewriting manifest",
+		"original_url", originalURL,
+		"bypass_segments", bypassSegments,
+		"no_bypass", noBypass,
+		"manifest_size", len(manifest),
+	)
 
 	var result bytes.Buffer
 	scanner := bufio.NewScanner(bytes.NewReader(manifest))
@@ -150,24 +200,37 @@ func (h *HLSHandler) rewriteManifest(manifest []byte, originalURL, proxyBaseURL 
 		// Handle tags
 		if strings.HasPrefix(line, "#") {
 			// Rewrite URI in tags like #EXT-X-KEY, #EXT-X-MAP
+			// But check if the URI itself should bypass proxy
 			if strings.Contains(line, "URI=") {
-				line = h.rewriteURITag(line, baseURL, proxyBaseURL, headers)
+				line = h.rewriteURITag(line, baseURL, proxyBaseURL, headers, bypassSegments)
 			}
 			result.WriteString(line + "\n")
 			continue
 		}
 
-		// Rewrite segment URLs
+		// Rewrite segment URLs (unless bypassing)
 		segmentURL := h.resolveURL(line, baseURL)
-		proxyURL := h.buildProxyURL(segmentURL, proxyBaseURL, headers)
-		result.WriteString(proxyURL + "\n")
+
+		// Only bypass non-manifest URLs (actual segments)
+		// Sub-manifests (.m3u8) should still be proxied for header handling
+		// noBypass (from bypassSegments=false when noBypass=true) forces all through proxy
+		isManifest := strings.Contains(strings.ToLower(segmentURL), ".m3u8")
+		shouldBypass := !isManifest && (bypassSegments || (!noBypass && h.shouldBypassProxy(segmentURL)))
+
+		if shouldBypass {
+			// Don't proxy segments - use direct URL (fast-expiring tokens)
+			result.WriteString(segmentURL + "\n")
+		} else {
+			proxyURL := h.buildProxyURL(segmentURL, proxyBaseURL, headers)
+			result.WriteString(proxyURL + "\n")
+		}
 	}
 
 	return result.Bytes(), scanner.Err()
 }
 
 // rewriteURITag rewrites the URI attribute in HLS tags.
-func (h *HLSHandler) rewriteURITag(line string, baseURL *url.URL, proxyBaseURL string, headers map[string]string) string {
+func (h *HLSHandler) rewriteURITag(line string, baseURL *url.URL, proxyBaseURL string, headers map[string]string, bypassProxy bool) string {
 	// Find URI="..." pattern
 	start := strings.Index(line, "URI=\"")
 	if start == -1 {
@@ -182,28 +245,32 @@ func (h *HLSHandler) rewriteURITag(line string, baseURL *url.URL, proxyBaseURL s
 
 	uri := line[start : start+end]
 	resolvedURL := h.resolveURL(uri, baseURL)
-	proxyURL := h.buildProxyURL(resolvedURL, proxyBaseURL, headers)
 
+	// Check if this URL should bypass proxy
+	if bypassProxy || h.shouldBypassProxy(resolvedURL) {
+		return line[:start] + resolvedURL + line[start+end:]
+	}
+
+	proxyURL := h.buildProxyURL(resolvedURL, proxyBaseURL, headers)
 	return line[:start] + proxyURL + line[start+end:]
 }
 
 // resolveURL resolves a potentially relative URL against the base.
+// Uses shared utility that preserves original URL encoding.
 func (h *HLSHandler) resolveURL(urlStr string, base *url.URL) string {
-	if strings.HasPrefix(urlStr, "http://") || strings.HasPrefix(urlStr, "https://") {
-		return urlStr
-	}
-
-	ref, err := url.Parse(urlStr)
-	if err != nil {
-		return urlStr
-	}
-
-	return base.ResolveReference(ref).String()
+	return urlutil.ResolveURL(urlStr, base.String())
 }
 
 // buildProxyURL builds a proxy URL with the target URL and headers encoded.
 func (h *HLSHandler) buildProxyURL(targetURL, proxyBaseURL string, headers map[string]string) string {
-	proxyURL, _ := url.Parse(proxyBaseURL)
+	// Determine the correct endpoint based on URL type
+	path := "/proxy/stream"
+	lower := strings.ToLower(targetURL)
+	if strings.Contains(lower, ".m3u8") {
+		path = "/proxy/manifest.m3u8"
+	}
+
+	proxyURL, _ := url.Parse(proxyBaseURL + path)
 	query := proxyURL.Query()
 	query.Set("url", targetURL)
 

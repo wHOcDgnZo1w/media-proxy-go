@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -25,12 +26,12 @@ func New(level string, jsonFormat bool, w io.Writer) *Logger {
 	}
 
 	var lvl slog.Level
-	switch level {
+	switch strings.ToLower(level) {
 	case "debug":
 		lvl = slog.LevelDebug
 	case "info":
 		lvl = slog.LevelInfo
-	case "warn":
+	case "warn", "warning":
 		lvl = slog.LevelWarn
 	case "error":
 		lvl = slog.LevelError

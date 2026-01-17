@@ -3,17 +3,17 @@ package stremio
 
 // Manifest is the Stremio addon manifest.
 var Manifest = map[string]interface{}{
-	"id":          "org.stremio.dvr-local",
+	"id":          "org.stremio.mediaproxy-dvr",
 	"version":     "1.0.0",
-	"name":        "DVR Recordings",
-	"description": "Local addon for MediaProxy DVR recordings",
+	"name":        "MediaProxy DVR",
+	"description": "DVR recordings from MediaProxy",
 	"resources":   []string{"catalog", "stream", "meta"},
 	"types":       []string{"tv"},
 	"catalogs": []map[string]interface{}{
 		{
 			"type": "tv",
-			"id":   "dvr-recordings",
-			"name": "DVR Recordings",
+			"id":   "mediaproxy-dvr-recordings",
+			"name": "MediaProxy Recordings",
 			"extra": []map[string]interface{}{
 				{
 					"name":       "genre",

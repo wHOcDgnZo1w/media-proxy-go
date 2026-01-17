@@ -2,8 +2,6 @@
 package appctx
 
 import (
-	"fmt"
-
 	"media-proxy-go/pkg/config"
 	"media-proxy-go/pkg/interfaces"
 	"media-proxy-go/pkg/logging"
@@ -18,6 +16,7 @@ type Context struct {
 	ProxyService     *services.ProxyService
 	Transcoder       interfaces.Transcoder
 	RecordingManager interfaces.RecordingManager
+	HTTPClient       interfaces.HTTPClient
 	BaseURL          string
 }
 
@@ -26,7 +25,7 @@ func New(cfg *config.Config, log *logging.Logger) *Context {
 	return &Context{
 		Config:  cfg,
 		Log:     log,
-		BaseURL: fmt.Sprintf("http://localhost:%d", cfg.Port),
+		BaseURL: cfg.BaseURL,
 	}
 }
 
@@ -45,5 +44,11 @@ func (c *Context) WithTranscoder(t interfaces.Transcoder) *Context {
 // WithRecordingManager sets the recording manager.
 func (c *Context) WithRecordingManager(rm interfaces.RecordingManager) *Context {
 	c.RecordingManager = rm
+	return c
+}
+
+// WithHTTPClient sets the HTTP client.
+func (c *Context) WithHTTPClient(client interfaces.HTTPClient) *Context {
+	c.HTTPClient = client
 	return c
 }

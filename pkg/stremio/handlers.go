@@ -214,12 +214,12 @@ func (h *Handlers) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	// Remove .json suffix if present
 	catalogID = strings.TrimSuffix(catalogID, ".json")
 
-	if catalogType != "tv" || !strings.HasPrefix(catalogID, "dvr-recordings") {
+	if catalogType != "tv" || !strings.HasPrefix(catalogID, "mediaproxy-dvr-recordings") {
 		h.jsonResponse(w, map[string][]Meta{"metas": {}})
 		return
 	}
 
-	// Extract search query if present (format: dvr-recordings/search=query.json)
+	// Extract search query if present (format: mediaproxy-dvr-recordings/search=query.json)
 	searchQuery := ""
 	if idx := strings.Index(catalogID, "/search="); idx != -1 {
 		searchQuery = strings.ToLower(catalogID[idx+8:])
@@ -237,11 +237,21 @@ func (h *Handlers) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.log.Info("stremio catalog: got recordings from manager", "total_count", len(recordings))
+
 	// Separate active and completed recordings
 	var active []*types.Recording
 	var completed []*types.Recording
 
 	for _, rec := range recordings {
+		h.log.Debug("processing recording",
+			"id", rec.ID,
+			"name", rec.Name,
+			"status", rec.Status,
+			"file_size", rec.FileSize,
+			"file_path", rec.FilePath,
+		)
+
 		// Apply search filter if present
 		if searchQuery != "" {
 			if !strings.Contains(strings.ToLower(rec.Name), searchQuery) {
@@ -256,6 +266,12 @@ func (h *Handlers) handleCatalog(w http.ResponseWriter, r *http.Request) {
 			isFinished := rec.Status == string(types.RecordingStatusCompleted) ||
 				rec.Status == "stopped" ||
 				rec.Status == string(types.RecordingStatusFailed)
+			h.log.Debug("recording filter check",
+				"id", rec.ID,
+				"has_valid_file", hasValidFile,
+				"is_finished", isFinished,
+				"will_include", isFinished && hasValidFile,
+			)
 			if isFinished && hasValidFile {
 				completed = append(completed, rec)
 			}
@@ -280,7 +296,7 @@ func (h *Handlers) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		metas[i] = h.recordingToMeta(rec)
 	}
 
-	h.log.Debug("returning recordings", "count", len(metas))
+	h.log.Info("stremio catalog: returning recordings", "active", len(active), "completed", len(completed), "total", len(metas))
 	h.jsonResponseNoCache(w, map[string][]Meta{"metas": metas})
 }
 
@@ -334,13 +350,13 @@ func (h *Handlers) handleStream(w http.ResponseWriter, r *http.Request) {
 	var streams []Stream
 
 	if recording.Status == string(types.RecordingStatusRecording) {
-		// Active recording: offer Stop & Watch
-		stopURL := fmt.Sprintf("%s/api/recordings/%s/stop", h.ctx.BaseURL, recordingID)
-		streams = append(streams, Stream{URL: stopURL, Title: "Stop Recording"})
+		// Active recording: offer Stop & Watch (uses GET endpoint that stops and redirects to stream)
+		stopAndWatchURL := fmt.Sprintf("%s/record/stop/%s", h.ctx.BaseURL, recordingID)
+		streams = append(streams, Stream{URL: stopAndWatchURL, Title: "Stop & Watch"})
 	} else {
 		// Completed recording: offer Play and Delete
 		streamURL := fmt.Sprintf("%s/api/recordings/%s/stream", h.ctx.BaseURL, recordingID)
-		deleteURL := fmt.Sprintf("%s/api/recordings/%s", h.ctx.BaseURL, recordingID)
+		deleteURL := fmt.Sprintf("%s/api/recordings/%s/delete", h.ctx.BaseURL, recordingID)
 		streams = append(streams, Stream{URL: streamURL, Title: "Play Recording"})
 		streams = append(streams, Stream{URL: deleteURL, Title: "Delete Recording"})
 	}

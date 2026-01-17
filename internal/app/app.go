@@ -5,6 +5,7 @@ import (
 	"media-proxy-go/pkg/appctx"
 	"media-proxy-go/pkg/config"
 	"media-proxy-go/pkg/extractors"
+	"media-proxy-go/pkg/flaresolverr"
 	"media-proxy-go/pkg/handlers/api"
 	"media-proxy-go/pkg/handlers/streams"
 	"media-proxy-go/pkg/httpclient"
@@ -39,6 +40,7 @@ func New() (*App, error) {
 
 	// Create HTTP client
 	httpClient := httpclient.New(cfg, log)
+	ctx.WithHTTPClient(httpClient)
 
 	// Initialize stream handler registry
 	streamHandlers := registry.NewStreamHandlerRegistry()
@@ -57,11 +59,18 @@ func New() (*App, error) {
 	// Register stream handlers
 	registerStreamHandlers(streamHandlers, httpClient, log, ctx.BaseURL, ctx.Transcoder)
 
-	// Register extractors
-	registerExtractors(extractorReg, httpClient, log)
+	// Create FlareSolverr client if configured
+	var flareClient *flaresolverr.Client
+	if cfg.FlareSolverrURL != "" {
+		flareClient = flaresolverr.NewClient(cfg.FlareSolverrURL, cfg.FlareSolverrTimeout, log)
+		log.Info("FlareSolverr client enabled", "url", cfg.FlareSolverrURL)
+	}
 
-	// Initialize recording manager
-	rm, err := services.NewRecordingManager(cfg, log)
+	// Register extractors
+	registerExtractors(extractorReg, httpClient, log, flareClient)
+
+	// Initialize recording manager (needs baseURL to route recordings through local proxy)
+	rm, err := services.NewRecordingManager(cfg, log, ctx.BaseURL)
 	if err != nil {
 		log.Warn("failed to initialize recording manager", "error", err)
 	} else {
@@ -150,6 +159,7 @@ func registerExtractors(
 	reg *registry.ExtractorRegistry,
 	client *httpclient.Client,
 	log *logging.Logger,
+	flareClient *flaresolverr.Client,
 ) {
 	// Register Vavoo extractor
 	vavooExtractor := extractors.NewVavooExtractor(client, log)
@@ -162,6 +172,14 @@ func registerExtractors(
 	// Register Streamtape extractor
 	streamtapeExtractor := extractors.NewStreamtapeExtractor(client, log)
 	reg.Register(streamtapeExtractor)
+
+	// Register Freeshot extractor (popcdn.day/lovecdn)
+	freeshotExtractor := extractors.NewFreeshotExtractor(client, log)
+	reg.Register(freeshotExtractor)
+
+	// Register DLHD extractor (dlhd.dad/daddylive)
+	dlhdExtractor := extractors.NewDLHDExtractor(client, log, flareClient)
+	reg.Register(dlhdExtractor)
 
 	// Set generic extractor as fallback
 	genericExtractor := extractors.NewGenericExtractor(client, log)

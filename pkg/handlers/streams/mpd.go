@@ -8,29 +8,29 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"media-proxy-go/pkg/httpclient"
 	"media-proxy-go/pkg/interfaces"
 	"media-proxy-go/pkg/logging"
 	"media-proxy-go/pkg/types"
+	"media-proxy-go/pkg/urlutil"
 )
 
-// MPDHandler processes DASH/MPD streams using FFmpeg transcoding.
+// MPDHandler processes DASH/MPD streams by converting to HLS on-the-fly.
 type MPDHandler struct {
-	client     *httpclient.Client
-	log        *logging.Logger
-	baseURL    string
-	transcoder interfaces.Transcoder
+	client  *httpclient.Client
+	log     *logging.Logger
+	baseURL string
 }
 
 // NewMPDHandler creates a new MPD stream handler.
-func NewMPDHandler(client *httpclient.Client, log *logging.Logger, baseURL string, transcoder interfaces.Transcoder) *MPDHandler {
+func NewMPDHandler(client *httpclient.Client, log *logging.Logger, baseURL string, _ interfaces.Transcoder) *MPDHandler {
 	return &MPDHandler{
-		client:     client,
-		log:        log.WithComponent("mpd-handler"),
-		baseURL:    baseURL,
-		transcoder: transcoder,
+		client:  client,
+		log:     log.WithComponent("mpd-handler"),
+		baseURL: baseURL,
 	}
 }
 
@@ -47,39 +47,10 @@ func (h *MPDHandler) CanHandle(urlStr string) bool {
 		strings.Contains(lower, "manifest(format=mpd")
 }
 
-// HandleManifest handles MPD manifests, transcoding to HLS via FFmpeg.
+// HandleManifest handles MPD manifests by converting to HLS.
 func (h *MPDHandler) HandleManifest(ctx context.Context, req *types.StreamRequest, baseURL string) (*types.StreamResponse, error) {
 	h.log.Debug("handling MPD manifest", "url", req.URL)
 
-	if h.transcoder != nil {
-		return h.handleWithFFmpeg(ctx, req, baseURL)
-	}
-
-	// Fallback if transcoder unavailable
-	return h.handleLegacy(ctx, req, baseURL)
-}
-
-// handleWithFFmpeg uses FFmpeg to transcode MPD to HLS.
-func (h *MPDHandler) handleWithFFmpeg(ctx context.Context, req *types.StreamRequest, baseURL string) (*types.StreamResponse, error) {
-	streamID, err := h.transcoder.StartStream(ctx, req.URL, req.Headers, req.ClearKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to start transcoding: %w", err)
-	}
-
-	// Build redirect URL to FFmpeg stream
-	streamPath := h.transcoder.GetStreamPath(streamID)
-	redirectURL := fmt.Sprintf("%s/ffmpeg_stream/%s/index.m3u8", baseURL, streamID)
-
-	h.log.Debug("redirecting to FFmpeg stream", "stream_id", streamID, "path", streamPath)
-
-	return &types.StreamResponse{
-		StatusCode:  http.StatusFound,
-		RedirectURL: redirectURL,
-	}, nil
-}
-
-// handleLegacy rewrites MPD manifest and proxies through the proxy.
-func (h *MPDHandler) handleLegacy(ctx context.Context, req *types.StreamRequest, baseURL string) (*types.StreamResponse, error) {
 	// Fetch the original MPD manifest
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, req.URL, nil)
 	if err != nil {
@@ -88,6 +59,9 @@ func (h *MPDHandler) handleLegacy(ctx context.Context, req *types.StreamRequest,
 
 	for key, value := range req.Headers {
 		httpReq.Header.Set(key, value)
+	}
+	if httpReq.Header.Get("User-Agent") == "" {
+		httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	}
 
 	resp, err := h.client.Do(httpReq)
@@ -105,16 +79,35 @@ func (h *MPDHandler) handleLegacy(ctx context.Context, req *types.StreamRequest,
 		return nil, fmt.Errorf("failed to read MPD: %w", err)
 	}
 
-	// Rewrite the MPD manifest
-	rewritten, err := h.rewriteMPD(body, req.URL, baseURL, req.Headers, req.ClearKey)
+	// Check if requesting specific representation (media playlist)
+	if req.RepID != "" {
+		playlist, err := h.convertMediaPlaylist(body, req.RepID, baseURL, req.URL, req.Headers, req.ClearKey)
+		if err != nil {
+			return nil, err
+		}
+		return &types.StreamResponse{
+			ContentType: "application/vnd.apple.mpegurl",
+			Body:        io.NopCloser(bytes.NewReader([]byte(playlist))),
+			StatusCode:  http.StatusOK,
+			Headers: map[string]string{
+				"Cache-Control": "no-cache, no-store, must-revalidate",
+			},
+		}, nil
+	}
+
+	// Generate master playlist
+	playlist, err := h.convertMasterPlaylist(body, baseURL, req.URL, req.Headers, req.ClearKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to rewrite MPD: %w", err)
+		return nil, err
 	}
 
 	return &types.StreamResponse{
-		ContentType: "application/dash+xml",
-		Body:        io.NopCloser(bytes.NewReader(rewritten)),
+		ContentType: "application/vnd.apple.mpegurl",
+		Body:        io.NopCloser(bytes.NewReader([]byte(playlist))),
 		StatusCode:  http.StatusOK,
+		Headers: map[string]string{
+			"Cache-Control": "no-cache, no-store, must-revalidate",
+		},
 	}, nil
 }
 
@@ -152,150 +145,435 @@ func (h *MPDHandler) HandleSegment(ctx context.Context, req *types.StreamRequest
 	}, nil
 }
 
-// rewriteMPD rewrites URLs in an MPD manifest.
-func (h *MPDHandler) rewriteMPD(manifest []byte, originalURL, proxyBaseURL string, headers map[string]string, clearKey string) ([]byte, error) {
-	baseURL, err := url.Parse(originalURL)
+// convertMasterPlaylist generates an HLS master playlist from MPD.
+func (h *MPDHandler) convertMasterPlaylist(manifest []byte, proxyBaseURL, originalURL string, headers map[string]string, clearKey string) (string, error) {
+	mpd, err := h.parseMPD(manifest)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	// Parse as XML to rewrite URLs
-	var mpd MPD
-	if err := xml.Unmarshal(manifest, &mpd); err != nil {
-		// If XML parsing fails, return original
-		h.log.Warn("failed to parse MPD as XML, returning original", "error", err)
-		return manifest, nil
-	}
+	var lines []string
+	lines = append(lines, "#EXTM3U", "#EXT-X-VERSION:3")
 
-	// Rewrite BaseURL elements
-	for i := range mpd.BaseURL {
-		mpd.BaseURL[i] = h.buildProxyURL(h.resolveURL(mpd.BaseURL[i], baseURL), proxyBaseURL, headers)
-	}
+	audioGroupID := "audio"
+	hasAudio := false
 
-	// Rewrite URLs in Periods
-	for pi := range mpd.Period {
-		period := &mpd.Period[pi]
-
-		for ai := range period.AdaptationSet {
-			adaptSet := &period.AdaptationSet[ai]
-
-			// Rewrite SegmentTemplate
-			if adaptSet.SegmentTemplate != nil {
-				h.rewriteSegmentTemplate(adaptSet.SegmentTemplate, baseURL, proxyBaseURL, headers)
+	// Process audio tracks
+	for _, period := range mpd.Periods {
+		for _, as := range period.AdaptationSets {
+			if !h.isAudio(as) {
+				continue
 			}
-
-			// Rewrite Representations
-			for ri := range adaptSet.Representation {
-				rep := &adaptSet.Representation[ri]
-				if rep.SegmentTemplate != nil {
-					h.rewriteSegmentTemplate(rep.SegmentTemplate, baseURL, proxyBaseURL, headers)
+			for _, rep := range as.Representations {
+				mediaURL := h.buildMediaPlaylistURL(proxyBaseURL, originalURL, rep.ID, headers, clearKey)
+				lang := as.Lang
+				if lang == "" {
+					lang = "und"
 				}
-				if rep.BaseURL != "" {
-					rep.BaseURL = h.buildProxyURL(h.resolveURL(rep.BaseURL, baseURL), proxyBaseURL, headers)
+				name := fmt.Sprintf("Audio %s (%s)", lang, rep.Bandwidth)
+
+				defaultAttr := "NO"
+				if !hasAudio {
+					defaultAttr = "YES"
+				}
+
+				lines = append(lines, fmt.Sprintf(
+					`#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="%s",NAME="%s",LANGUAGE="%s",DEFAULT=%s,AUTOSELECT=YES,URI="%s"`,
+					audioGroupID, name, lang, defaultAttr, mediaURL,
+				))
+				hasAudio = true
+			}
+		}
+	}
+
+	// Find max video height for quality filtering
+	maxHeight := 0
+	for _, period := range mpd.Periods {
+		for _, as := range period.AdaptationSets {
+			if !h.isVideo(as) {
+				continue
+			}
+			for _, rep := range as.Representations {
+				if rep.Height > maxHeight {
+					maxHeight = rep.Height
 				}
 			}
 		}
 	}
 
-	// Add ClearKey ContentProtection if provided
+	// Process video tracks
+	for _, period := range mpd.Periods {
+		for _, as := range period.AdaptationSets {
+			if !h.isVideo(as) {
+				continue
+			}
+			for _, rep := range as.Representations {
+				// Filter to highest quality only
+				if rep.Height < maxHeight {
+					continue
+				}
+
+				mediaURL := h.buildMediaPlaylistURL(proxyBaseURL, originalURL, rep.ID, headers, clearKey)
+
+				inf := fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%s", rep.Bandwidth)
+				if rep.Width > 0 && rep.Height > 0 {
+					inf += fmt.Sprintf(",RESOLUTION=%dx%d", rep.Width, rep.Height)
+				}
+				if rep.FrameRate != "" {
+					inf += fmt.Sprintf(",FRAME-RATE=%s", rep.FrameRate)
+				}
+				if rep.Codecs != "" {
+					inf += fmt.Sprintf(",CODECS=\"%s\"", rep.Codecs)
+				}
+				if hasAudio {
+					inf += fmt.Sprintf(",AUDIO=\"%s\"", audioGroupID)
+				}
+
+				lines = append(lines, inf, mediaURL)
+			}
+		}
+	}
+
+	return strings.Join(lines, "\n"), nil
+}
+
+// convertMediaPlaylist generates an HLS media playlist for a specific representation.
+func (h *MPDHandler) convertMediaPlaylist(manifest []byte, repID, proxyBaseURL, originalURL string, headers map[string]string, clearKey string) (string, error) {
+	mpd, err := h.parseMPD(manifest)
+	if err != nil {
+		return "", err
+	}
+
+	// Find the representation
+	var rep *Representation
+	var as *AdaptationSet
+	for _, period := range mpd.Periods {
+		for i := range period.AdaptationSets {
+			for j := range period.AdaptationSets[i].Representations {
+				if period.AdaptationSets[i].Representations[j].ID == repID {
+					rep = &period.AdaptationSets[i].Representations[j]
+					as = &period.AdaptationSets[i]
+					break
+				}
+			}
+		}
+	}
+
+	if rep == nil {
+		return "#EXTM3U\n#EXT-X-ERROR: Representation not found", nil
+	}
+
+	isLive := strings.ToLower(mpd.Type) == "dynamic"
+
+	var lines []string
+	lines = append(lines, "#EXTM3U", "#EXT-X-VERSION:3")
+
+	if isLive {
+		lines = append(lines, "#EXT-X-START:TIME-OFFSET=-30.0,PRECISE=NO")
+	} else {
+		lines = append(lines, "#EXT-X-TARGETDURATION:10", "#EXT-X-PLAYLIST-TYPE:VOD")
+	}
+
+	// Get segment template (from representation or adaptation set)
+	st := rep.SegmentTemplate
+	if st == nil {
+		st = as.SegmentTemplate
+	}
+
+	if st == nil {
+		return "#EXTM3U\n#EXT-X-ERROR: No SegmentTemplate found", nil
+	}
+
+	timescale := 1
+	if st.Timescale != "" {
+		timescale, _ = strconv.Atoi(st.Timescale)
+	}
+
+	startNumber := 1
+	if st.StartNumber != "" {
+		startNumber, _ = strconv.Atoi(st.StartNumber)
+	}
+
+	// Resolve base URL
+	baseURL := h.getBaseURL(mpd, originalURL)
+
+	// Build segments from timeline
+	segments := h.buildSegmentsFromTimeline(st, repID, rep.Bandwidth, timescale, startNumber)
+
+	// For live: sliding window of last 20 segments
+	if isLive && len(segments) > 20 {
+		segments = segments[len(segments)-20:]
+	}
+
+	if len(segments) > 0 {
+		// Calculate target duration from max segment duration
+		maxDur := 0.0
+		for _, seg := range segments {
+			if seg.Duration > maxDur {
+				maxDur = seg.Duration
+			}
+		}
+
+		if isLive {
+			// Calculate media sequence from first segment time
+			mediaSeq := segments[0].Time / int64(segments[0].DurationTS)
+			lines = append(lines, fmt.Sprintf("#EXT-X-TARGETDURATION:%d", int(maxDur)+1))
+			lines = append(lines, fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d", mediaSeq))
+		}
+	}
+
+	// Determine if we need server-side decryption (for TS remux)
+	useDecrypt := clearKey != "" || true // Always use decrypt endpoint for TS remux
+
+	// Build init segment URL
+	initURL := ""
+	if st.Initialization != "" {
+		initPath := h.replaceTemplateVars(st.Initialization, repID, rep.Bandwidth, 0, 0)
+		initURL = h.resolveURL(initPath, baseURL)
+	}
+
+	// Add segments
+	for _, seg := range segments {
+		lines = append(lines, fmt.Sprintf("#EXTINF:%.3f,", seg.Duration))
+
+		segURL := h.resolveURL(seg.URL, baseURL)
+
+		if useDecrypt {
+			// Use decrypt endpoint for TS output
+			proxyURL := h.buildDecryptURL(proxyBaseURL, segURL, initURL, headers, clearKey)
+			lines = append(lines, proxyURL)
+		} else {
+			// Direct segment proxy
+			proxyURL := h.buildSegmentProxyURL(proxyBaseURL, segURL, headers)
+			lines = append(lines, proxyURL)
+		}
+	}
+
+	if !isLive {
+		lines = append(lines, "#EXT-X-ENDLIST")
+	}
+
+	return strings.Join(lines, "\n"), nil
+}
+
+type segment struct {
+	URL        string
+	Duration   float64
+	DurationTS int
+	Time       int64
+	Number     int
+}
+
+func (h *MPDHandler) buildSegmentsFromTimeline(st *SegmentTemplate, repID, bandwidth string, timescale, startNumber int) []segment {
+	var segments []segment
+
+	if st.SegmentTimeline == nil {
+		return segments
+	}
+
+	currentTime := int64(0)
+	segmentNumber := startNumber
+
+	for _, s := range st.SegmentTimeline.S {
+		if s.T != "" {
+			t, _ := strconv.ParseInt(s.T, 10, 64)
+			currentTime = t
+		}
+
+		d, _ := strconv.Atoi(s.D)
+		r := 0
+		if s.R != "" {
+			r, _ = strconv.Atoi(s.R)
+		}
+
+		duration := float64(d) / float64(timescale)
+
+		// Repeat r+1 times
+		for i := 0; i <= r; i++ {
+			segPath := h.replaceTemplateVars(st.Media, repID, bandwidth, segmentNumber, currentTime)
+
+			segments = append(segments, segment{
+				URL:        segPath,
+				Duration:   duration,
+				DurationTS: d,
+				Time:       currentTime,
+				Number:     segmentNumber,
+			})
+
+			currentTime += int64(d)
+			segmentNumber++
+		}
+	}
+
+	return segments
+}
+
+func (h *MPDHandler) replaceTemplateVars(template, repID, bandwidth string, number int, time int64) string {
+	result := template
+	result = strings.ReplaceAll(result, "$RepresentationID$", repID)
+	result = strings.ReplaceAll(result, "$Bandwidth$", bandwidth)
+	result = strings.ReplaceAll(result, "$Number$", strconv.Itoa(number))
+	result = strings.ReplaceAll(result, "$Time$", strconv.FormatInt(time, 10))
+	return result
+}
+
+func (h *MPDHandler) getBaseURL(mpd *MPD, originalURL string) string {
+	if len(mpd.BaseURLs) > 0 && mpd.BaseURLs[0] != "" {
+		return mpd.BaseURLs[0]
+	}
+	// Use directory of original URL
+	// Important: use string manipulation to preserve original URL encoding
+	// (Go's url.Parse + Path modification + String() re-encodes special chars)
+	queryIdx := strings.Index(originalURL, "?")
+	if queryIdx > 0 {
+		originalURL = originalURL[:queryIdx]
+	}
+	lastSlash := strings.LastIndex(originalURL, "/")
+	if lastSlash > 0 {
+		return originalURL[:lastSlash+1]
+	}
+	return originalURL
+}
+
+func (h *MPDHandler) resolveURL(urlStr string, base string) string {
+	return urlutil.ResolveURL(urlStr, base)
+}
+
+func (h *MPDHandler) isVideo(as AdaptationSet) bool {
+	return strings.Contains(as.MimeType, "video") || strings.Contains(as.ContentType, "video")
+}
+
+func (h *MPDHandler) isAudio(as AdaptationSet) bool {
+	return strings.Contains(as.MimeType, "audio") || strings.Contains(as.ContentType, "audio")
+}
+
+func (h *MPDHandler) buildMediaPlaylistURL(proxyBaseURL, originalURL, repID string, headers map[string]string, clearKey string) string {
+	u, _ := url.Parse(proxyBaseURL + "/proxy/hls/manifest.m3u8")
+	q := u.Query()
+	q.Set("d", originalURL)
+	q.Set("format", "hls")
+	q.Set("rep_id", repID)
+	for k, v := range headers {
+		q.Set("h_"+k, v)
+	}
 	if clearKey != "" {
-		h.addClearKeyProtection(&mpd, clearKey, proxyBaseURL)
+		q.Set("clearkey", clearKey)
 	}
-
-	return xml.MarshalIndent(mpd, "", "  ")
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
-// rewriteSegmentTemplate rewrites URLs in a SegmentTemplate.
-func (h *MPDHandler) rewriteSegmentTemplate(st *SegmentTemplate, baseURL *url.URL, proxyBaseURL string, headers map[string]string) {
-	if st.Initialization != "" && !strings.Contains(st.Initialization, "$") {
-		st.Initialization = h.buildProxyURL(h.resolveURL(st.Initialization, baseURL), proxyBaseURL, headers)
+func (h *MPDHandler) buildSegmentProxyURL(proxyBaseURL, segmentURL string, headers map[string]string) string {
+	u, _ := url.Parse(proxyBaseURL + "/proxy/stream")
+	q := u.Query()
+	q.Set("url", segmentURL)
+	for k, v := range headers {
+		q.Set("h_"+k, v)
 	}
-	if st.Media != "" && !strings.Contains(st.Media, "$") {
-		st.Media = h.buildProxyURL(h.resolveURL(st.Media, baseURL), proxyBaseURL, headers)
-	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
-// addClearKeyProtection adds ClearKey ContentProtection to the MPD.
-func (h *MPDHandler) addClearKeyProtection(mpd *MPD, clearKey, proxyBaseURL string) {
-	licenseURL := fmt.Sprintf("%s/license?clearkey=%s", proxyBaseURL, url.QueryEscape(clearKey))
-
-	cp := ContentProtection{
-		SchemeIdUri: "urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e",
-		Value:       "ClearKey1.0",
-		ClearKeyLicenseURL: &ClearKeyLicenseURL{
-			LicenseType: "EME-1.0",
-			URL:         licenseURL,
-		},
+func (h *MPDHandler) buildDecryptURL(proxyBaseURL, segmentURL, initURL string, headers map[string]string, clearKey string) string {
+	u, _ := url.Parse(proxyBaseURL + "/decrypt/segment.ts")
+	q := u.Query()
+	q.Set("url", segmentURL)
+	if initURL != "" {
+		q.Set("init_url", initURL)
+	}
+	for k, v := range headers {
+		q.Set("h_"+k, v)
 	}
 
-	// Add to all AdaptationSets
-	for pi := range mpd.Period {
-		for ai := range mpd.Period[pi].AdaptationSet {
-			mpd.Period[pi].AdaptationSet[ai].ContentProtection = append(
-				mpd.Period[pi].AdaptationSet[ai].ContentProtection, cp)
+	// Parse clearkey and add key/key_id params
+	// Supports formats:
+	// - Single key: "KID:KEY"
+	// - Multi-key: "KID1:KEY1,KID2:KEY2"
+	if clearKey != "" {
+		var kids, keys []string
+		pairs := strings.Split(clearKey, ",")
+		for _, pair := range pairs {
+			if kv := strings.SplitN(pair, ":", 2); len(kv) == 2 {
+				kids = append(kids, strings.TrimSpace(kv[0]))
+				keys = append(keys, strings.TrimSpace(kv[1]))
+			}
 		}
+		if len(kids) > 0 && len(keys) > 0 {
+			q.Set("key_id", strings.Join(kids, ","))
+			q.Set("key", strings.Join(keys, ","))
+		}
+	} else {
+		// No key - use skip_decrypt for remux only
+		q.Set("key_id", "00000000000000000000000000000000")
+		q.Set("key", "00000000000000000000000000000000")
+		q.Set("skip_decrypt", "1")
 	}
+
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
-func (h *MPDHandler) resolveURL(urlStr string, base *url.URL) string {
-	if strings.HasPrefix(urlStr, "http://") || strings.HasPrefix(urlStr, "https://") {
-		return urlStr
+// parseMPD parses an MPD manifest into a structured format.
+func (h *MPDHandler) parseMPD(data []byte) (*MPD, error) {
+	// Add namespace if missing
+	content := string(data)
+	if !strings.Contains(content, "xmlns") {
+		content = strings.Replace(content, "<MPD", `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"`, 1)
 	}
-	ref, err := url.Parse(urlStr)
-	if err != nil {
-		return urlStr
-	}
-	return base.ResolveReference(ref).String()
-}
 
-func (h *MPDHandler) buildProxyURL(targetURL, proxyBaseURL string, headers map[string]string) string {
-	proxyURL, _ := url.Parse(proxyBaseURL + "/proxy/stream")
-	query := proxyURL.Query()
-	query.Set("url", targetURL)
-	for key, value := range headers {
-		query.Set("h_"+key, value)
+	var mpd MPD
+	if err := xml.Unmarshal([]byte(content), &mpd); err != nil {
+		return nil, fmt.Errorf("failed to parse MPD: %w", err)
 	}
-	proxyURL.RawQuery = query.Encode()
-	return proxyURL.String()
+	return &mpd, nil
 }
 
 // MPD XML structures
 type MPD struct {
-	XMLName xml.Name `xml:"MPD"`
-	BaseURL []string `xml:"BaseURL,omitempty"`
-	Period  []Period `xml:"Period"`
+	XMLName  xml.Name `xml:"MPD"`
+	Type     string   `xml:"type,attr"`
+	BaseURLs []string `xml:"BaseURL"`
+	Periods  []Period `xml:"Period"`
 }
 
 type Period struct {
-	AdaptationSet []AdaptationSet `xml:"AdaptationSet"`
+	AdaptationSets []AdaptationSet `xml:"AdaptationSet"`
 }
 
 type AdaptationSet struct {
-	ContentProtection []ContentProtection `xml:"ContentProtection,omitempty"`
-	SegmentTemplate   *SegmentTemplate    `xml:"SegmentTemplate,omitempty"`
-	Representation    []Representation    `xml:"Representation"`
+	MimeType        string           `xml:"mimeType,attr"`
+	ContentType     string           `xml:"contentType,attr"`
+	Lang            string           `xml:"lang,attr"`
+	SegmentTemplate *SegmentTemplate `xml:"SegmentTemplate"`
+	Representations []Representation `xml:"Representation"`
 }
 
 type Representation struct {
-	ID              string           `xml:"id,attr,omitempty"`
-	BaseURL         string           `xml:"BaseURL,omitempty"`
-	SegmentTemplate *SegmentTemplate `xml:"SegmentTemplate,omitempty"`
+	ID              string           `xml:"id,attr"`
+	Bandwidth       string           `xml:"bandwidth,attr"`
+	Width           int              `xml:"width,attr"`
+	Height          int              `xml:"height,attr"`
+	FrameRate       string           `xml:"frameRate,attr"`
+	Codecs          string           `xml:"codecs,attr"`
+	SegmentTemplate *SegmentTemplate `xml:"SegmentTemplate"`
 }
 
 type SegmentTemplate struct {
-	Initialization string `xml:"initialization,attr,omitempty"`
-	Media          string `xml:"media,attr,omitempty"`
+	Timescale       string           `xml:"timescale,attr"`
+	Initialization  string           `xml:"initialization,attr"`
+	Media           string           `xml:"media,attr"`
+	StartNumber     string           `xml:"startNumber,attr"`
+	SegmentTimeline *SegmentTimeline `xml:"SegmentTimeline"`
 }
 
-type ContentProtection struct {
-	SchemeIdUri        string             `xml:"schemeIdUri,attr"`
-	Value              string             `xml:"value,attr,omitempty"`
-	ClearKeyLicenseURL *ClearKeyLicenseURL `xml:"clearkey:Laurl,omitempty"`
+type SegmentTimeline struct {
+	S []SegmentTimelineS `xml:"S"`
 }
 
-type ClearKeyLicenseURL struct {
-	LicenseType string `xml:"Lic_type,attr,omitempty"`
-	URL         string `xml:",chardata"`
+type SegmentTimelineS struct {
+	T string `xml:"t,attr"`
+	D string `xml:"d,attr"`
+	R string `xml:"r,attr"`
 }
 
 var _ interfaces.StreamHandler = (*MPDHandler)(nil)

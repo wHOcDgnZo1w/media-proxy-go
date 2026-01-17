@@ -44,6 +44,35 @@ func (s *ProxyService) HandleManifest(ctx context.Context, req *types.StreamRequ
 	decodedURL := s.decodeURL(req.URL)
 	req.URL = decodedURL
 
+	// Check if URL needs extraction first (e.g., popcdn.day -> planetary.lovecdn.ru)
+	extractor := s.extractorRegistry.Get(req.URL)
+	if extractor != nil && extractor.Name() != "generic" {
+		s.log.Debug("URL needs extraction", "url", req.URL, "extractor", extractor.Name())
+
+		opts := interfaces.ExtractOptions{
+			Headers: req.Headers,
+		}
+
+		result, err := extractor.Extract(ctx, req.URL, opts)
+		if err != nil {
+			s.log.Error("extraction failed", "url", req.URL, "error", err)
+			return nil, fmt.Errorf("extraction failed: %w", err)
+		}
+
+		s.log.Debug("extracted URL", "original", req.URL, "destination", result.DestinationURL)
+
+		// Update request with extracted URL and headers
+		req.URL = result.DestinationURL
+		if result.RequestHeaders != nil {
+			if req.Headers == nil {
+				req.Headers = make(map[string]string)
+			}
+			for k, v := range result.RequestHeaders {
+				req.Headers[k] = v
+			}
+		}
+	}
+
 	// Get appropriate handler
 	handler := s.streamHandlers.Get(req.URL)
 	if handler == nil {
