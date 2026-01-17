@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  media-proxy:
+    build:
+      context: .
+      dockerfile: Containerfile
+    container_name: media-proxy-go
+    ports:
+      - "${PORT:-7860}:7860"
+    environment:
+      - PORT=7860
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_JSON=${LOG_JSON:-true}
+      - API_PASSWORD=${API_PASSWORD:-}
+      - MAX_RECORDING_DURATION=${MAX_RECORDING_DURATION:-28800}
+      - RECORDINGS_RETENTION_DAYS=${RECORDINGS_RETENTION_DAYS:-7}
+      - GLOBAL_PROXIES=${GLOBAL_PROXIES:-}
+      - TRANSPORT_ROUTES=${TRANSPORT_ROUTES:-}
+    volumes:
+      - recordings:/app/recordings
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:7860/api/info"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  recordings:
